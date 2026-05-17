@@ -1,0 +1,73 @@
+2026-03-04 19:32:38 - root - INFO - Загрузка файла test.txt
+2026-03-04 19:32:38 - root - ERROR - Сбой в работе программы: [Errno 2] No such file or directory: 'test.txt'
+Traceback (most recent call last):
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 93, in main
+    points = load_txt("test.txt")
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 44, in load_txt
+    with open(filepath, 'r') as f:
+         ~~~~^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'test.txt'
+2026-03-04 19:32:58 - root - INFO - Загрузка файла test.txt
+2026-03-04 19:32:58 - root - ERROR - Сбой в работе программы: [Errno 2] No such file or directory: 'test.txt'
+Traceback (most recent call last):
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 93, in main
+    points = load_txt("test.txt")
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 44, in load_txt
+    with open(filepath, 'r') as f:
+         ~~~~^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'test.txt'
+2026-03-04 19:33:56 - root - INFO - Загрузка файла test.txt
+2026-03-04 19:33:56 - root - ERROR - Сбой в работе программы: Файл test.txt не содержит точек
+Traceback (most recent call last):
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 93, in main
+    points = load_txt("test.txt")
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 65, in load_txt
+    raise EmptyFileError(f"Файл {filepath} не содержит точек")
+exceptions.EmptyFileError: Файл test.txt не содержит точек
+2026-03-04 19:34:54 - root - INFO - Загрузка файла test.txt
+2026-03-04 19:34:54 - root - INFO - Контур успешно загружен
+2026-03-04 19:35:24 - root - INFO - Загрузка файла test.txt
+2026-03-04 19:35:24 - root - ERROR - Сбой в работе программы: Файл test.txt не содержит точек
+Traceback (most recent call last):
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 93, in main
+    points = load_txt("test.txt")
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 65, in load_txt
+    raise EmptyFileError(f"Файл {filepath} не содержит точек")
+exceptions.EmptyFileError: Файл test.txt не содержит точек
+2026-03-04 19:35:48 - root - INFO - Загрузка файла test.txt
+2026-03-04 19:35:48 - root - ERROR - Сбой в работе программы: Строка 3: ожидалось 2 числа, получено 1: 10
+Traceback (most recent call last):
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 93, in main
+    points = load_txt("test.txt")
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 52, in load_txt
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: Строка 3: ожидалось 2 числа, получено 1: 10
+2026-03-04 19:36:32 - root - INFO - Загрузка файла test.txt
+2026-03-04 19:36:32 - root - ERROR - Сбой в работе программы: Для построения контура нужно минимум 3 точки, получено 2
+Traceback (most recent call last):
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 93, in main
+    points = load_txt("test.txt")
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 67, in load_txt
+    raise InsufficientPointsError(
+    ...<2 lines>...
+    )
+exceptions.InsufficientPointsError: Для построения контура нужно минимум 3 точки, получено 2
+2026-03-04 19:38:11 - root - INFO - Загрузка файла test.txt
+2026-03-04 19:38:11 - root - ERROR - Сбой в работе программы: Строка 3: некорректные данные: 10 Р°РїРІР°РїР°РІРї
+Traceback (most recent call last):
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 58, in load_txt
+    y = float(parts[1])
+ValueError: could not convert string to float: 'Р°РїРІР°РїР°РІРї'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 93, in main
+    points = load_txt("test.txt")
+  File "C:\Users\cinem\PycharmProjects\path planning\loader.py", line 60, in load_txt
+    raise InvalidFormatError(
+        f"Строка {line_number}: некорректные данные: {line}"
+    ) from e
+exceptions.InvalidFormatError: Строка 3: некорректные данные: 10 Р°РїРІР°РїР°РІРї
