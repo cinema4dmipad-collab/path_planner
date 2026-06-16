@@ -1,0 +1,30 @@
+﻿{"issues": [], "summary": {"total_files": 1, "files_with_issues": 0, "total_issues": 0, "fixed_issues": 0, "errored": false}}
+poetry : Traceback (most recent call last):
+At C:\Users\mf1\AppData\Local\Temp\ps-script-28f54054-d7c9-49cc-a6d8-4947fddd561c.ps1:88 char:32
++ ... h_planner"; poetry run marimo check planning/path_planner_app.py --st ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "D:\Development\venvs\plannig-4PEnX4B7-py3.13\Scripts\marimo.exe\__main__.py", line 7, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "D:\Development\venvs\plannig-4PEnX4B7-py3.13\Lib\site-packages\click\core.py", line 1485, in __call__
+    return self.main(*args, **kwargs)
+           ~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "D:\Development\venvs\plannig-4PEnX4B7-py3.13\Lib\site-packages\click\core.py", line 1406, in main
+    rv = self.invoke(ctx)
+  File "D:\Development\venvs\plannig-4PEnX4B7-py3.13\Lib\site-packages\click\core.py", line 1873, in invoke
+    return _process_result(sub_ctx.command.invoke(sub_ctx))
+                           ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "D:\Development\venvs\plannig-4PEnX4B7-py3.13\Lib\site-packages\click\core.py", line 1269, in invoke
+    return ctx.invoke(self.callback, **ctx.params)
+           ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Development\venvs\plannig-4PEnX4B7-py3.13\Lib\site-packages\click\core.py", line 824, in invoke
+    return callback(*args, **kwargs)
+  File "D:\Development\venvs\plannig-4PEnX4B7-py3.13\Lib\site-packages\marimo\_cli\cli.py", line 1485, in check
+    if linter.errored or (strict and (fixed > 0 or total_issues > 0)):
+                                      ^^^^^
+UnboundLocalError: cannot access local variable 'fixed' where it is not associated with a value

@@ -1,0 +1,3 @@
+#1 [0] LWPOLYLINE skipped=False reason='' path=22 holes=1
+#2 [0] LWPOLYLINE skipped=True reason='отверстие внутри другого контура' path=0 holes=0
+direct planner path len=22

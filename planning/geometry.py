@@ -43,8 +43,10 @@ class Contour:
         x = self.points[:, 0]
         y = self.points[:, 1]
         result = (x.min(), x.max(), y.min(), y.max())
-        print(
-            f"📐 bounds: x[{result[0]:.2f}, {result[1]:.2f}], y[{result[2]:.2f}, {result[3]:.2f}]")
+        logger.debug(
+            "bounds: x[%.2f, %.2f], y[%.2f, %.2f]",
+            result[0], result[1], result[2], result[3],
+        )
         return result
 
     def perimeter(self) -> float:
@@ -79,7 +81,7 @@ class Contour:
             simplified = self._simplify_rdp(
                 epsilon=self.approximation_tolerance * 0.3)
             logger.info(
-                f"Упрощение: {len(self.points)} → {len(simplified)} точек")
+                f"Упрощение: {len(self.points)} -> {len(simplified)} точек")
             return Contour(simplified, self.approximation_tolerance)
 
         elif mode == self.MODE_MORE:
@@ -87,7 +89,7 @@ class Contour:
             densified = self._densify(
                 target_distance=self.approximation_tolerance * 2)
             logger.info(
-                f"Уплотнение: {len(self.points)} → {len(densified)} точек")
+                f"Уплотнение: {len(self.points)} -> {len(densified)} точек")
             return Contour(densified, self.approximation_tolerance)
 
         else:
@@ -218,6 +220,86 @@ class Contour:
         t = (y - y1) / (y2 - y1)
         return p1[0] + t * (p2[0] - p1[0])
 
+    @staticmethod
+    def _line_line_intersection(
+        a1: np.ndarray,
+        a2: np.ndarray,
+        b1: np.ndarray,
+        b2: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """Пересечение двух прямых (бесконечных), заданных отрезками."""
+        x1, y1 = float(a1[0]), float(a1[1])
+        x2, y2 = float(a2[0]), float(a2[1])
+        x3, y3 = float(b1[0]), float(b1[1])
+        x4, y4 = float(b2[0]), float(b2[1])
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(denom) < 1e-12:
+            return None
+        px = (
+            (x1 * y2 - y1 * x2) * (x3 - x4)
+            - (x1 - x2) * (x3 * y4 - y3 * x4)
+        ) / denom
+        py = (
+            (x1 * y2 - y1 * x2) * (y3 - y4)
+            - (y1 - y2) * (x3 * y4 - y3 * x4)
+        ) / denom
+        return np.array([px, py], dtype=float)
+
+    def offset_outward(self, distance: float) -> "Contour":
+        """
+        Расширяет контур наружу на distance мм.
+
+        Используется для зоны безопасности вокруг внутренних контуров (отверстий).
+        """
+        if distance <= 0:
+            return Contour(self.points.copy(), self.approximation_tolerance)
+
+        pts = self.points.copy()
+        if len(pts) > 1 and np.allclose(pts[0], pts[-1]):
+            pts = pts[:-1]
+        if len(pts) < 3:
+            return Contour(self.points.copy(), self.approximation_tolerance)
+
+        centroid = pts.mean(axis=0)
+        offset_edges: List[Tuple[np.ndarray, np.ndarray]] = []
+
+        for i in range(len(pts)):
+            p1 = pts[i]
+            p2 = pts[(i + 1) % len(pts)]
+            edge = p2 - p1
+            length = float(np.linalg.norm(edge))
+            if length <= 1e-12:
+                continue
+            direction = edge / length
+            normal = np.array([-direction[1], direction[0]])
+            mid = (p1 + p2) / 2.0
+            if np.dot(normal, centroid - mid) > 0:
+                normal = -normal
+            offset_edges.append((p1 + normal * distance, p2 + normal * distance))
+
+        if len(offset_edges) < 3:
+            return Contour(self.points.copy(), self.approximation_tolerance)
+
+        new_points: List[np.ndarray] = []
+        edge_count = len(offset_edges)
+        for i in range(edge_count):
+            a1, a2 = offset_edges[i]
+            b1, b2 = offset_edges[(i + 1) % edge_count]
+            point = self._line_line_intersection(a1, a2, b1, b2)
+            if point is not None:
+                new_points.append(point)
+
+        if len(new_points) < 3:
+            return Contour(self.points.copy(), self.approximation_tolerance)
+
+        logger.debug(
+            "offset_outward %.3f мм: %d -> %d точек",
+            distance,
+            len(pts),
+            len(new_points),
+        )
+        return Contour(np.array(new_points), self.approximation_tolerance)
+
     def rotate(self, angle_deg: float) -> 'Contour':
         """
         Поворачивает контур на заданный угол.
@@ -248,10 +330,10 @@ class Contour:
         distance = np.linalg.norm(last - first)
 
         if distance > tolerance:
-            print(f"🔒 Контур не замкнут, добавляем первую точку")
+            logger.debug("Контур не замкнут, добавляем первую точку")
             self.points = np.vstack([self.points, first])
         else:
-            print(f"✅ Контур уже замкнут")
+            logger.debug("Контур уже замкнут")
 
         return self
 

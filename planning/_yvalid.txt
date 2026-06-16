@@ -1,0 +1,6 @@
+y=61.52 valid=False inside=False holes=False
+y=-40.31 valid=False inside=False holes=False
+y=8.60 valid=True inside=True holes=False
+y=-21.71 valid=False inside=False holes=True
+y=30.00 valid=False inside=False holes=False
+y=50.00 valid=False inside=False holes=False

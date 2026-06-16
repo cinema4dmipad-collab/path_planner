@@ -1,260 +1,525 @@
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple, Union
+
 import numpy as np
 
-from pathlib import Path
-from typing import List, Tuple, Optional, Union
-
+from exceptions import (
+    DXFLoadError,
+    FileNotFoundError as DXFNotFoundError,
+    InsufficientPointsError,
+    UnsupportedEntityError,
+)
 from logger import logger
-
 
 try:
     import ezdxf
-    from ezdxf.math import Vec2
 
     EZDXF_AVAILABLE = True
 except ImportError:
     EZDXF_AVAILABLE = False
 
-from exceptions import (
-    DXFLoadError,
-    UnsupportedEntityError,
-    FileNotFoundError as DXFNotFoundError
-)
+
+Point2D = Tuple[float, float]
+Segment = Tuple[np.ndarray, np.ndarray]
+
+
+class ContourSelection(str, Enum):
+    """Стратегия выбора контура из DXF."""
+
+    LARGEST_CLOSED = "largest_closed"
+    FIRST_CLOSED = "first_closed"
+    FIRST = "first"
+
+
+@dataclass(frozen=True)
+class DXFContourInfo:
+    """Описание одного контура, извлечённого из DXF."""
+
+    points: np.ndarray
+    is_closed: bool
+    layer: str
+    entity_types: Tuple[str, ...]
+    area: float
+
+    @property
+    def num_points(self) -> int:
+        return len(self.points)
 
 
 class DXFLoader:
     """
-    Загрузчик контуров из DXF-файлов.
-    Поддерживает различные геометрические примитивы.
+    Загрузчик контуров из DXF.
+
+    Извлекает отдельные кривые/цепочки, дискретизирует дуги и bulge-сегменты,
+    затем выбирает подходящий контур для заливки.
     """
 
-    SUPPORTED_ENTITIES = {
-        'LINE', 'LWPOLYLINE', 'POLYLINE',
-        'ARC', 'CIRCLE', 'SPLINE', 'ELLIPSE'
-    }
+    SUPPORTED_ENTITIES = frozenset({
+        "LINE",
+        "LWPOLYLINE",
+        "POLYLINE",
+        "ARC",
+        "CIRCLE",
+        "SPLINE",
+        "ELLIPSE",
+        "INSERT",
+    })
 
-    def __init__(self, tolerance: float = 0.1):
-        """
-        Args:
-            tolerance: точность дискретизации кривых (мм)
-        """
+    def __init__(self, tolerance: float = 0.1, join_tolerance: float = 1e-3):
+        if tolerance <= 0:
+            raise ValueError("tolerance должен быть > 0")
         self.tolerance = tolerance
+        self.join_tolerance = join_tolerance
 
-    def load(self, filepath: Union[str, Path]) -> np.ndarray:
-        """
-        Загружает контур из DXF-файла.
+    def load(
+        self,
+        filepath: Union[str, Path],
+        *,
+        layer: Optional[str] = None,
+        selection: ContourSelection = ContourSelection.LARGEST_CLOSED,
+        closed_only: bool = True,
+    ) -> np.ndarray:
+        """Загружает один контур из DXF (точки формы (n, 2))."""
+        contour = self.load_selected_contour(
+            filepath,
+            layer=layer,
+            selection=selection,
+            closed_only=closed_only,
+        )
+        return contour.points
 
-        Args:
-            filepath: путь к DXF-файлу
+    def load_selected_contour(
+        self,
+        filepath: Union[str, Path],
+        *,
+        layer: Optional[str] = None,
+        selection: ContourSelection = ContourSelection.LARGEST_CLOSED,
+        closed_only: bool = True,
+    ) -> DXFContourInfo:
+        """Загружает и возвращает метаданные выбранного контура."""
+        contours = self.load_contours(filepath, layer=layer)
+        if not contours:
+            raise DXFLoadError("В DXF-файле не найдено поддерживаемых примитивов")
 
-        Returns:
-            numpy array с точками контура формы (n, 2)
+        return self._select_contour(
+            contours,
+            selection=selection,
+            closed_only=closed_only,
+        )
 
-        Raises:
-            DXFNotFoundError: если файл не существует
-            DXFLoadError: если не удалось загрузить DXF
-            UnsupportedEntityError: если встречен неподдерживаемый тип
-        """
+    def load_contours(
+        self,
+        filepath: Union[str, Path],
+        *,
+        layer: Optional[str] = None,
+    ) -> List[DXFContourInfo]:
+        """Извлекает все найденные контуры из DXF."""
         if not EZDXF_AVAILABLE:
             raise ImportError(
-                "Библиотека ezdxf не установлена. "
-                "Установите: poetry add ezdxf"
+                "Библиотека ezdxf не установлена. Установите: poetry add ezdxf"
             )
 
         filepath = Path(filepath)
         if not filepath.exists():
             raise DXFNotFoundError(f"Файл не найден: {filepath}")
 
-        logger.info(f"Загрузка DXF-файла: {filepath}")
+        logger.info("Загрузка DXF-файла: %s", filepath)
 
         try:
             doc = ezdxf.readfile(str(filepath))
-        except Exception as e:
-            raise DXFLoadError(f"Не удалось прочитать DXF-файл: {e}")
+        except Exception as exc:
+            raise DXFLoadError(f"Не удалось прочитать DXF-файл: {exc}") from exc
 
-        # Собираем все точки из modelspace
-        points = []
-        msp = doc.modelspace()
+        raw_contours: List[DXFContourInfo] = []
+        line_segments: List[Segment] = []
 
-        for entity in msp:
+        for entity in doc.modelspace():
+            if layer is not None and entity.dxf.layer != layer:
+                continue
+
             dxftype = entity.dxftype()
-
             if dxftype not in self.SUPPORTED_ENTITIES:
-                logger.warning(f"Пропущен неподдерживаемый тип: {dxftype}")
+                logger.warning("Пропущен неподдерживаемый тип: %s", dxftype)
                 continue
 
             try:
-                entity_points = self._process_entity(entity)
-                points.extend(entity_points)
-            except Exception as e:
-                logger.error(f"Ошибка обработки {dxftype}: {e}")
+                if dxftype == "LINE":
+                    line_segments.extend(self._process_line(entity))
+                elif dxftype == "INSERT":
+                    raw_contours.extend(self._process_insert(entity, layer))
+                else:
+                    raw_contours.extend(self._process_entity(entity))
+            except Exception as exc:
+                logger.error("Ошибка обработки %s: %s", dxftype, exc)
                 continue
 
-        if not points:
-            raise DXFLoadError(
-                "В DXF-файле не найдено поддерживаемых примитивов")
+        if line_segments:
+            raw_contours.extend(self._chain_line_segments(line_segments))
 
-        # Объединяем все точки в единый контур
-        # (в реальном DXF может быть несколько контуров, но для простоты берём все)
-        all_points = np.vstack(points)
+        contours = [self._finalize_contour(info) for info in raw_contours]
+        contours = [info for info in contours if info.num_points >= 3]
 
-        logger.info(f"Загружено {len(all_points)} точек из DXF")
-        return all_points
+        if not contours:
+            raise DXFLoadError("Не удалось построить контур с минимум 3 точками")
 
-    def _process_entity(self, entity) -> List[np.ndarray]:
-        """
-        Обрабатывает отдельный примитив DXF.
+        logger.info("Из DXF извлечено контуров: %d", len(contours))
+        return contours
 
-        Returns:
-            Список массивов точек для данного примитива
-        """
+    def _process_insert(
+        self,
+        insert,
+        layer_filter: Optional[str],
+    ) -> List[DXFContourInfo]:
+        contours: List[DXFContourInfo] = []
+        line_segments: List[Segment] = []
+
+        for entity in insert.virtual_entities():
+            if layer_filter is not None and entity.dxf.layer != layer_filter:
+                continue
+
+            dxftype = entity.dxftype()
+            if dxftype not in self.SUPPORTED_ENTITIES or dxftype == "INSERT":
+                continue
+
+            if dxftype == "LINE":
+                line_segments.extend(self._process_line(entity))
+            else:
+                contours.extend(self._process_entity(entity))
+
+        if line_segments:
+            contours.extend(self._chain_line_segments(line_segments))
+
+        return contours
+
+    def _process_entity(self, entity) -> List[DXFContourInfo]:
         dxftype = entity.dxftype()
+        layer = entity.dxf.layer
 
-        if dxftype == 'LINE':
-            return self._process_line(entity)
-        elif dxftype in ('LWPOLYLINE', 'POLYLINE'):
-            return self._process_polyline(entity)
-        elif dxftype == 'ARC':
-            return self._process_arc(entity)
-        elif dxftype == 'CIRCLE':
-            return self._process_circle(entity)
-        elif dxftype == 'SPLINE':
-            return self._process_spline(entity)
-        elif dxftype == 'ELLIPSE':
-            return self._process_ellipse(entity)
+        if dxftype in ("LWPOLYLINE", "POLYLINE"):
+            points = self._discretize_polyline(entity)
+        elif dxftype == "ARC":
+            points = self._discretize_arc(entity)
+        elif dxftype == "CIRCLE":
+            points = self._discretize_circle(entity)
+        elif dxftype == "SPLINE":
+            points = self._discretize_spline(entity)
+        elif dxftype == "ELLIPSE":
+            points = self._discretize_ellipse(entity)
         else:
             raise UnsupportedEntityError(f"Неподдерживаемый тип: {dxftype}")
 
-    def _process_line(self, line) -> List[np.ndarray]:
-        """Обрабатывает отрезок."""
-        start = line.dxf.start
-        end = line.dxf.end
-        return [np.array([[start.x, start.y], [end.x, end.y]])]
+        if len(points) < 2:
+            return []
 
-    def _process_polyline(self, polyline) -> List[np.ndarray]:
-        """Обрабатывает полилинию (ломаная линия)."""
-        points = []
+        is_closed = self._entity_is_closed(entity, points)
+        area = self._polygon_area(points) if is_closed else 0.0
+        return [
+            DXFContourInfo(
+                points=points,
+                is_closed=is_closed,
+                layer=layer,
+                entity_types=(dxftype,),
+                area=area,
+            )
+        ]
 
-        if polyline.dxftype() == 'LWPOLYLINE':
-            # Для LWPOLYLINE точки хранятся в vertices
-            for vertex in polyline.vertices():
-                points.append([vertex.dxf.location.x, vertex.dxf.location.y])
+    def _process_line(self, line) -> List[Segment]:
+        start = np.array([line.dxf.start.x, line.dxf.start.y], dtype=float)
+        end = np.array([line.dxf.end.x, line.dxf.end.y], dtype=float)
+        return [(start, end)]
+
+    def _chain_line_segments(self, segments: Sequence[Segment]) -> List[DXFContourInfo]:
+        if not segments:
+            return []
+
+        remaining = list(segments)
+        chains: List[List[np.ndarray]] = []
+
+        while remaining:
+            current = remaining.pop(0)
+            chain = [current[0].copy(), current[1].copy()]
+
+            changed = True
+            while changed:
+                changed = False
+                for idx in range(len(remaining) - 1, -1, -1):
+                    seg = remaining[idx]
+                    appended = self._try_append_segment(chain, seg)
+                    if appended:
+                        remaining.pop(idx)
+                        changed = True
+
+            layer = "0"
+            points = np.array(chain, dtype=float)
+            is_closed = self._points_are_closed(points)
+            area = self._polygon_area(points) if is_closed else 0.0
+            chains.append(
+                DXFContourInfo(
+                    points=points,
+                    is_closed=is_closed,
+                    layer=layer,
+                    entity_types=("LINE",),
+                    area=area,
+                )
+            )
+
+        return chains
+
+    def _try_append_segment(self, chain: List[np.ndarray], segment: Segment) -> bool:
+        start, end = segment
+        head = chain[0]
+        tail = chain[-1]
+
+        if self._points_close(tail, start):
+            chain.append(end.copy())
+            return True
+        if self._points_close(tail, end):
+            chain.append(start.copy())
+            return True
+        if self._points_close(head, end):
+            chain.insert(0, start.copy())
+            return True
+        if self._points_close(head, start):
+            chain.insert(0, end.copy())
+            return True
+        return False
+
+    def _discretize_polyline(self, polyline) -> np.ndarray:
+        if hasattr(polyline, "flattening"):
+            try:
+                vertices = list(polyline.flattening(self.tolerance))
+                if vertices:
+                    return np.array([[v.x, v.y] for v in vertices], dtype=float)
+            except TypeError:
+                pass
+
+        points: List[Point2D] = []
+        if polyline.dxftype() == "LWPOLYLINE":
+            for x, y, *_ in polyline.get_points("xy"):
+                points.append((float(x), float(y)))
         else:
-            # Для POLYLINE
             for vertex in polyline.vertices:
-                points.append([vertex.dxf.location.x, vertex.dxf.location.y])
+                loc = vertex.dxf.location
+                points.append((float(loc.x), float(loc.y)))
 
-        return [np.array(points)]
+        return np.array(points, dtype=float)
 
-    def _process_arc(self, arc) -> List[np.ndarray]:
-        """
-        Обрабатывает дугу, разбивая на отрезки с заданной точностью.
-        """
+    def _curve_segment_count(
+        self,
+        radius: float,
+        total_angle: float = 2 * math.pi,
+        *,
+        min_segments: int = 8,
+    ) -> int:
+        """Число сегментов по хордовой ошибке (как flattening в ezdxf)."""
+        if radius <= 0 or total_angle <= 0:
+            return min_segments
+        max_error = self.tolerance
+        if max_error >= radius:
+            return min_segments
+        cos_val = max(-1.0, min(1.0, 1.0 - max_error / radius))
+        segment_angle = 2.0 * math.acos(cos_val)
+        if segment_angle <= 1e-12:
+            return min_segments
+        return max(min_segments, int(math.ceil(total_angle / segment_angle)))
+
+    def _discretize_arc(self, arc) -> np.ndarray:
         center = arc.dxf.center
-        radius = arc.dxf.radius
-        start_angle = arc.dxf.start_angle
-        end_angle = arc.dxf.end_angle
+        radius = float(arc.dxf.radius)
+        start_rad = np.radians(float(arc.dxf.start_angle))
+        end_rad = np.radians(float(arc.dxf.end_angle))
 
-        # Переводим углы в радианы
-        start_rad = np.radians(start_angle)
-        end_rad = np.radians(end_angle)
+        if end_rad < start_rad:
+            end_rad += 2 * np.pi
 
-        # Длина дуги
-        arc_length = radius * abs(end_rad - start_rad)
+        arc_angle = abs(end_rad - start_rad)
+        num_segments = self._curve_segment_count(
+            radius, arc_angle, min_segments=3
+        )
 
-        # Количество сегментов для аппроксимации
-        num_segments = max(3, int(np.ceil(arc_length / self.tolerance)))
-
-        # Генерируем точки на дуге
-        points = []
+        points: List[Point2D] = []
         for i in range(num_segments + 1):
             t = i / num_segments
             angle = start_rad + t * (end_rad - start_rad)
-            x = center.x + radius * np.cos(angle)
-            y = center.y + radius * np.sin(angle)
-            points.append([x, y])
+            points.append(
+                (
+                    center.x + radius * np.cos(angle),
+                    center.y + radius * np.sin(angle),
+                )
+            )
+        return np.array(points, dtype=float)
 
-        return [np.array(points)]
-
-    def _process_circle(self, circle) -> List[np.ndarray]:
-        """Обрабатывает окружность как замкнутую дугу."""
+    def _discretize_circle(self, circle) -> np.ndarray:
         center = circle.dxf.center
-        radius = circle.dxf.radius
+        radius = float(circle.dxf.radius)
+        num_segments = self._curve_segment_count(radius)
 
-        # Длина окружности
-        circumference = 2 * np.pi * radius
-        num_segments = max(8, int(np.ceil(circumference / self.tolerance)))
-
-        points = []
+        points: List[Point2D] = []
         for i in range(num_segments + 1):
             angle = 2 * np.pi * i / num_segments
-            x = center.x + radius * np.cos(angle)
-            y = center.y + radius * np.sin(angle)
-            points.append([x, y])
+            points.append(
+                (
+                    center.x + radius * np.cos(angle),
+                    center.y + radius * np.sin(angle),
+                )
+            )
+        return np.array(points, dtype=float)
 
-        return [np.array(points)]
-
-    def _process_spline(self, spline) -> List[np.ndarray]:
-        """
-        Обрабатывает сплайн, аппроксимируя его отрезками.
-        Использует встроенный метод flattening библиотеки ezdxf.
-        """
-        # Получаем аппроксимированные точки сплайна
-        # (метод flattening разбивает сплайн на отрезки с заданной точностью)
+    def _discretize_spline(self, spline) -> np.ndarray:
         vertices = list(spline.flattening(self.tolerance))
+        return np.array([[v.x, v.y] for v in vertices], dtype=float)
 
-        points = [[v.x, v.y] for v in vertices]
-        return [np.array(points)]
-
-    def _process_ellipse(self, ellipse) -> List[np.ndarray]:
-        """Обрабатывает эллипс."""
+    def _discretize_ellipse(self, ellipse) -> np.ndarray:
         center = ellipse.dxf.center
         major_axis = ellipse.dxf.major_axis
-        ratio = ellipse.dxf.ratio  # отношение малой оси к большой
+        ratio = float(ellipse.dxf.ratio)
 
-        # Параметры эллипса
-        a = np.linalg.norm([major_axis.x, major_axis.y])  # большая полуось
-        b = a * ratio  # малая полуось
+        a = float(np.hypot(major_axis.x, major_axis.y))
+        b = a * ratio
+        angle = float(np.arctan2(major_axis.y, major_axis.x))
 
-        # Угол поворота эллипса
-        angle = np.arctan2(major_axis.y, major_axis.x)
+        num_segments = self._curve_segment_count(max(a, b))
 
-        # Длина эллипса (приближённо)
-        circumference = np.pi * (
-                    3 * (a + b) - np.sqrt((3 * a + b) * (a + 3 * b)))
-        num_segments = max(8, int(np.ceil(circumference / self.tolerance)))
-
-        points = []
+        points: List[Point2D] = []
         for i in range(num_segments + 1):
             t = 2 * np.pi * i / num_segments
-
-            # Точка в локальной системе координат
             x_local = a * np.cos(t)
             y_local = b * np.sin(t)
-
-            # Поворот
             x_rot = x_local * np.cos(angle) - y_local * np.sin(angle)
             y_rot = x_local * np.sin(angle) + y_local * np.cos(angle)
+            points.append((center.x + x_rot, center.y + y_rot))
 
-            # Сдвиг в центр
-            x = center.x + x_rot
-            y = center.y + y_rot
+        return np.array(points, dtype=float)
 
-            points.append([x, y])
+    def _entity_is_closed(self, entity, points: np.ndarray) -> bool:
+        if hasattr(entity, "closed"):
+            if bool(entity.closed):
+                return True
+        if hasattr(entity, "is_closed"):
+            if bool(entity.is_closed):
+                return True
+        if entity.dxftype() == "CIRCLE":
+            return True
+        return self._points_are_closed(points)
 
-        return [np.array(points)]
+    def _points_are_closed(self, points: np.ndarray) -> bool:
+        if len(points) < 3:
+            return False
+        return bool(np.linalg.norm(points[0] - points[-1]) <= self.join_tolerance)
+
+    def _points_close(self, a: np.ndarray, b: np.ndarray) -> bool:
+        return bool(np.linalg.norm(a - b) <= self.join_tolerance)
+
+    def _polygon_area(self, points: np.ndarray) -> float:
+        if len(points) < 3:
+            return 0.0
+        pts = points
+        if not self._points_are_closed(pts):
+            pts = np.vstack([pts, pts[0]])
+        x = pts[:, 0]
+        y = pts[:, 1]
+        return float(0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+    def _finalize_contour(self, info: DXFContourInfo) -> DXFContourInfo:
+        points = self._dedupe_consecutive(info.points)
+        is_closed = info.is_closed or self._points_are_closed(points)
+        area = self._polygon_area(points) if is_closed else 0.0
+        return DXFContourInfo(
+            points=points,
+            is_closed=is_closed,
+            layer=info.layer,
+            entity_types=info.entity_types,
+            area=area,
+        )
+
+    def _dedupe_consecutive(self, points: np.ndarray) -> np.ndarray:
+        if len(points) == 0:
+            return points
+
+        deduped = [points[0]]
+        for point in points[1:]:
+            if not self._points_close(deduped[-1], point):
+                deduped.append(point)
+        return np.array(deduped, dtype=float)
+
+    def _select_contour(
+        self,
+        contours: Sequence[DXFContourInfo],
+        *,
+        selection: ContourSelection,
+        closed_only: bool,
+    ) -> DXFContourInfo:
+        if closed_only:
+            closed = [contour for contour in contours if contour.is_closed]
+            if not closed:
+                open_count = len(contours)
+                raise DXFLoadError(
+                    "В DXF не найдено замкнутых контуров "
+                    f"(найдено открытых: {open_count})"
+                )
+            pool = closed
+        else:
+            pool = list(contours)
+
+        if selection == ContourSelection.FIRST:
+            chosen = pool[0]
+        elif selection == ContourSelection.FIRST_CLOSED:
+            chosen = pool[0]
+        else:
+            chosen = max(pool, key=lambda contour: contour.area)
+
+        if chosen.num_points < 3:
+            raise InsufficientPointsError(
+                f"Выбранный контур содержит только {chosen.num_points} точек"
+            )
+
+        logger.info(
+            "Выбран контур: layer=%s, types=%s, closed=%s, points=%d, area=%.2f",
+            chosen.layer,
+            ",".join(chosen.entity_types),
+            chosen.is_closed,
+            chosen.num_points,
+            chosen.area,
+        )
+        return chosen
 
 
-# Функция-обёртка для простого использования
-def load_dxf(filepath: Union[str, Path], tolerance: float = 0.1) -> np.ndarray:
+def load_dxf(
+    filepath: Union[str, Path],
+    tolerance: float = 0.1,
+    *,
+    layer: Optional[str] = None,
+    selection: ContourSelection | str = ContourSelection.LARGEST_CLOSED,
+    closed_only: bool = True,
+) -> np.ndarray:
     """
     Загружает контур из DXF-файла.
 
-    Args:
-        filepath: путь к DXF-файлу
-        tolerance: точность дискретизации кривых (мм)
-
-    Returns:
-        numpy array с точками контура
+    По умолчанию выбирается самый большой замкнутый контур.
     """
+    if isinstance(selection, str):
+        selection = ContourSelection(selection)
+
     loader = DXFLoader(tolerance=tolerance)
-    return loader.load(filepath)
+    return loader.load(
+        filepath,
+        layer=layer,
+        selection=selection,
+        closed_only=closed_only,
+    )
+
+
+def load_dxf_contours(
+    filepath: Union[str, Path],
+    tolerance: float = 0.1,
+    *,
+    layer: Optional[str] = None,
+) -> List[DXFContourInfo]:
+    """Возвращает все контуры, найденные в DXF."""
+    loader = DXFLoader(tolerance=tolerance)
+    return loader.load_contours(filepath, layer=layer)

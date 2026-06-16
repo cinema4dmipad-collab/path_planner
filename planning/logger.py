@@ -5,7 +5,7 @@ from pathlib import Path
 
 def setup_logger(
         name: str = "path_planning",
-        level: int = logging.DEBUG,
+        level: int = logging.WARNING,
         log_file: Path = None
 ) -> logging.Logger:
     """

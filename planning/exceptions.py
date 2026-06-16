@@ -11,6 +11,10 @@ class InvalidFormatError(ContourError):
     """Некорректный формат данных в файле."""
 
 
+class BridgePlanningError(ContourError):
+    """Не удалось построить безопасный переход между сегментами траектории."""
+
+
 class DXFError(Exception):
     """Базовое исключение для ошибок DXF."""
     pass

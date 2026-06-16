@@ -1,0 +1,7 @@
+y=-35 valid=False
+y=-32 valid=False
+y=-28 valid=False
+y=-25 valid=False
+y=-22.87 valid=False
+y=-38 valid=False
+y=-40 valid=False
