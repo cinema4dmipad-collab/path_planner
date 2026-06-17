@@ -123,16 +123,6 @@ def _(mo):
         label="⚙️ **Режим дискретизации**",
     ).form()
 
-    clearance_slider = mo.ui.slider(
-        0.0, 5.0, step=0.1, value=0.0,
-        label="🛡️ **Безопасный радиус обхода** (мм)",
-    ).form()
-
-    clearance_contact_checkbox = mo.ui.checkbox(
-        value=True,
-        label="✅ **Проходить по линии безопасности** (снять = касаться нельзя)",
-    )
-
     parameter_controls = mo.vstack([
         mo.hstack(
             [tol_slider, step_slider, angle_slider],
@@ -140,46 +130,21 @@ def _(mo):
             gap=1,
         ),
         mo.hstack(
-            [mode_select, clearance_slider],
+            [mode_select],
             widths="equal",
             gap=1,
         ),
-        clearance_contact_checkbox,
     ])
     parameter_controls
-    return (
-        angle_slider,
-        clearance_contact_checkbox,
-        clearance_slider,
-        mode_select,
-        step_slider,
-        tol_slider,
-    )
+    return angle_slider, mode_select, step_slider, tol_slider
 
 
 @app.cell
-def _(
-    angle_slider,
-    clearance_contact_checkbox,
-    clearance_slider,
-    mo,
-    mode_select,
-    step_slider,
-    tol_slider,
-):
+def _(angle_slider, mo, mode_select, step_slider, tol_slider):
     tol = tol_slider.value if tol_slider.value is not None else 0.1
     step = step_slider.value if step_slider.value is not None else 2.0
     angle = angle_slider.value if angle_slider.value is not None else 0
     mode = mode_select.value if mode_select.value is not None else "as_is"
-    hole_clearance = (
-        clearance_slider.value if clearance_slider.value is not None else 0.0
-    )
-    allow_clearance_contact = bool(clearance_contact_checkbox.value)
-    contact_mode = (
-        "можно касаться линии"
-        if allow_clearance_contact
-        else "касание запрещено"
-    )
 
     mo.md(
         f"""
@@ -188,11 +153,9 @@ def _(
         - Шаг змейки: `{step:.1f}` мм
         - Угол: `{angle}°`
         - Режим дискретизации: `{mode}`
-        - Безопасный радиус обхода: `{hole_clearance:.1f}` мм
-        - Линия безопасности: **{contact_mode}**
         """
     )
-    return allow_clearance_contact, angle, hole_clearance, mode, step, tol
+    return angle, mode, step, tol
 
 
 @app.cell
@@ -203,11 +166,9 @@ def _(
     EmptyFileError,
     InsufficientPointsError,
     InvalidFormatError,
-    allow_clearance_contact,
     angle,
     file_loaded,
     filename,
-    hole_clearance,
     load_txt,
     mo,
     mode,
@@ -240,8 +201,6 @@ def _(
                 fill_angle=angle,
                 mode=mode,
                 closed_only=True,
-                hole_clearance=hole_clearance,
-                allow_clearance_contact=allow_clearance_contact,
             )
             summary = summarize_results(plan_results)
 
@@ -369,8 +328,6 @@ def _(
 @app.cell
 def _(
     Visualizer,
-    allow_clearance_contact,
-    hole_clearance,
     mode,
     plan_results,
     step,
@@ -423,8 +380,6 @@ def _(
             f"Tolerance: {tol:.3f} мм",
             f"Шаг: {step:.1f} мм",
             f"Режим: {mode}",
-            f"Безоп. радиус: {hole_clearance:.1f} мм",
-            f"Линия безоп.: {'касаться можно' if allow_clearance_contact else 'касаться нельзя'}",
         ]
         for skipped_item in plan_results:
             if skipped_item.skipped:

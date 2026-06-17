@@ -265,6 +265,20 @@ class Visualizer:
                     label=label,
                     zorder=10,
                 )
+            elif kind == "teleport_travel":
+                label = None if travel_label_used else "Переход сканера"
+                travel_label_used = True
+                ax.plot(
+                    segment_path[:, 0],
+                    segment_path[:, 1],
+                    color=self.colors['path_travel'],
+                    linewidth=1.8,
+                    alpha=0.75,
+                    linestyle=(0, (4, 2)),
+                    dash_capstyle="round",
+                    label=label,
+                    zorder=9,
+                )
             else:
                 label = None if travel_label_used else "Переход сканера"
                 travel_label_used = True

@@ -78,8 +78,6 @@ def plan_contour_points(
     stats = planner.get_statistics(path)
     stats["hole_count"] = len(hole_contours)
     stats["nesting_depth"] = nesting_depth
-    stats["hole_clearance"] = hole_clearance
-    stats["allow_clearance_contact"] = allow_clearance_contact
     path_segments = planner.get_path_segments()
 
     hole_points = tuple(hole.points.copy() for hole in hole_contours)

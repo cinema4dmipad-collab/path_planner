@@ -11,13 +11,40 @@ from geometry import Contour
 from planner import GEOM_EPSILON, PathPlanner, fill_segments_at_y
 
 
+def assert_travel_stays_on_surface(
+    test_case: unittest.TestCase,
+    path: np.ndarray,
+    segments: tuple[tuple[int, int, str], ...],
+    planner: PathPlanner,
+) -> None:
+    """Переходы не должны резать контур — только стенка или зона заливки."""
+    for start_idx, end_idx, kind in segments:
+        if kind != "travel":
+            continue
+        travel = path[start_idx : end_idx + 1]
+        for i in range(len(travel) - 1):
+            p1 = travel[i]
+            p2 = travel[i + 1]
+            test_case.assertTrue(
+                planner._segment_in_travel_zone(p1, p2),
+                f"Переход вне стенки/заливки: {p1} -> {p2}",
+            )
+
+
 def assert_path_avoids_rect_holes(
     test_case: unittest.TestCase,
     path: np.ndarray,
     holes: list[tuple[float, float, float, float]],
     margin: float = 0.01,
+    path_segments: tuple[tuple[int, int, str], ...] = (),
 ) -> None:
     """Проверяет, что точки и сегменты не попадают внутрь прямоугольных отверстий."""
+    skip_edges = {
+        index
+        for start_idx, end_idx, kind in path_segments
+        if kind == "teleport_travel"
+        for index in range(start_idx, end_idx)
+    }
     for xmin, ymin, xmax, ymax in holes:
         inside = (
             (path[:, 0] > xmin + margin)
@@ -31,6 +58,8 @@ def assert_path_avoids_rect_holes(
         )
 
     for i in range(len(path) - 1):
+        if i in skip_edges:
+            continue
         p1 = path[i]
         p2 = path[i + 1]
         if np.any(np.isnan(p1)) or np.any(np.isnan(p2)):
@@ -264,65 +293,6 @@ class TestHoleFillExclusion(unittest.TestCase):
                     f"Обход шестиугольника слишком низко: {travel}",
                 )
 
-    def test_hole_clearance_widens_fill_gap(self):
-        outer = Contour(np.array([[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]), 0.1)
-        hole = Contour(np.array([[3, 3], [7, 3], [7, 7], [3, 7], [3, 3]]), 0.1)
-        without = fill_segments_at_y(outer, 5.0, [hole])
-        with_clearance = fill_segments_at_y(outer, 5.0, [hole.offset_outward(1.0)])
-        self.assertEqual(without, [(0.0, 3.0), (7.0, 10.0)])
-        self.assertEqual(with_clearance, [(0.0, 2.0), (8.0, 10.0)])
-
-    def test_path_respects_hole_clearance(self):
-        outer = Contour(np.array([[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]), 0.1)
-        hole = Contour(np.array([[3, 3], [7, 3], [7, 7], [3, 7], [3, 7]]), 0.1)
-        planner = PathPlanner(
-            outer,
-            line_distance=2.0,
-            holes=[hole],
-            hole_clearance=1.0,
-        )
-        path = planner.generate_path()
-        self.assertGreater(len(path), 0)
-        assert_path_avoids_rect_holes(self, path, [(2, 2, 8, 8)], margin=0.05)
-
-    def test_strict_clearance_forbids_boundary_contact(self):
-        outer = Contour(np.array([[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]), 0.1)
-        hole = Contour(np.array([[3, 3], [7, 3], [7, 7], [3, 7], [3, 3]]), 0.1)
-        expanded = hole.offset_outward(1.0)
-        boundary_point = np.array([2.0, 5.0])
-
-        allow = PathPlanner(
-            outer,
-            line_distance=2.0,
-            holes=[hole],
-            hole_clearance=1.0,
-            allow_clearance_contact=True,
-        )
-        strict = PathPlanner(
-            outer,
-            line_distance=2.0,
-            holes=[hole],
-            hole_clearance=1.0,
-            allow_clearance_contact=False,
-        )
-
-        self.assertFalse(
-            allow._point_violates_clearance(boundary_point, allow.planning_holes[0])
-        )
-        self.assertTrue(
-            strict._point_violates_clearance(boundary_point, strict.planning_holes[0])
-        )
-
-        allow_segments = fill_segments_at_y(outer, 5.0, [expanded])
-        strict_segments = fill_segments_at_y(
-            outer,
-            5.0,
-            [expanded],
-            endpoint_inset=strict._fill_endpoint_inset(),
-        )
-        self.assertEqual(allow_segments[0][1], 2.0)
-        self.assertLess(strict_segments[0][1], 2.0)
-
     def test_two_phase_fill_returns_to_hole_gaps(self):
         outer = Contour(np.array([[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]), 0.1)
         hole = Contour(np.array([[3, 3], [7, 3], [7, 7], [3, 7], [3, 3]]), 0.1)
@@ -345,6 +315,41 @@ class TestHoleFillExclusion(unittest.TestCase):
             "Пропуски у отверстия должны заполняться отдельными проходами",
         )
         assert_path_avoids_rect_holes(self, path, [(3, 3, 7, 7)])
+
+    def test_deferred_fill_covers_three_hole_gaps(self):
+        outer = Contour(
+            np.array([[-45, -45], [45, -45], [45, 55], [-45, 55], [-45, -45]]),
+            0.1,
+        )
+        holes = [
+            Contour(np.array([[-25, -32], [-12, -32], [-12, -18], [-25, -18], [-25, -32]]), 0.1),
+            Contour(np.array([[-6, -34], [8, -34], [8, -18], [-6, -18], [-6, -34]]), 0.1),
+            Contour(np.array([[15, -32], [30, -32], [30, -16], [15, -16], [15, -32]]), 0.1),
+        ]
+        planner = PathPlanner(
+            outer,
+            line_distance=2.0,
+            holes=holes,
+        )
+        path = planner.generate_path()
+        stats = planner.get_statistics(path)
+
+        self.assertGreater(len(path), 0)
+        self.assertEqual(stats["filled_segments"], stats["num_lines"])
+        self.assertEqual(stats["skipped_deferred_segments"], 0)
+        segments = planner.get_path_segments()
+        self.assertFalse(
+            any(kind == "teleport_travel" for _, _, kind in segments),
+            "Дозаполнение не должно использовать прямые телепорты",
+        )
+        assert_travel_stays_on_surface(self, path, segments, planner)
+        assert_path_avoids_rect_holes(
+            self,
+            path,
+            [(-25, -32, -12, -18), (-6, -34, 8, -18), (15, -32, 30, -16)],
+            margin=0.05,
+            path_segments=segments,
+        )
 
     def test_snake_alternates_direction_without_holes(self):
         outer = Contour(

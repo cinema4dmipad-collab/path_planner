@@ -55,6 +55,7 @@ def fill_segments_at_y(
 
     Чистая геометрическая операция: outer intersections минус hole intervals.
     """
+    _ = endpoint_inset  # Deprecated compatibility arg: fill reaches real boundaries.
     outer_segments = segments_from_intersections(contour.get_intersections(y_level))
     if log_details:
         logger.debug("y=%.2f outer intervals: %s", y_level, outer_segments)
@@ -96,14 +97,6 @@ def fill_segments_at_y(
         for start, end in result
         if end - start > tolerance
     ]
-    if endpoint_inset > tolerance:
-        inset_segments: List[Tuple[float, float]] = []
-        for start, end in final:
-            inset_start = start + endpoint_inset
-            inset_end = end - endpoint_inset
-            if inset_end - inset_start > tolerance:
-                inset_segments.append((inset_start, inset_end))
-        final = inset_segments
     if log_details:
         logger.debug("y=%.2f fill segments: %s", y_level, final)
     return final
@@ -131,11 +124,15 @@ class PathPlanner:
         self.line_distance = line_distance
         self.fill_angle = fill_angle
         self.tolerance = tolerance
-        self.hole_clearance = max(0.0, float(hole_clearance))
-        self.allow_clearance_contact = allow_clearance_contact
+        _ = (hole_clearance, allow_clearance_contact)
+        self.hole_clearance = 0.0
+        self.allow_clearance_contact = True
         self.geom_epsilon = GEOM_EPSILON
         self.holes = holes or []
         self.path_segments: List[Tuple[int, int, str]] = []
+        self.skipped_primary_segments = 0
+        self.skipped_deferred_segments = 0
+        self.disconnected_deferred_segments = 0
         self._fill_lines_cache: Optional[List[np.ndarray]] = None
         self._path_cache: Optional[np.ndarray] = None
         self._bridge_route_cache: dict[
@@ -150,20 +147,7 @@ class PathPlanner:
         self.working_holes = [
             hole.rotate(fill_angle) for hole in self.holes
         ]
-        if self.hole_clearance > 0 and self.working_holes:
-            self.planning_holes = [
-                hole.offset_outward(self.hole_clearance)
-                for hole in self.working_holes
-            ]
-            logger.info(
-                "Безопасный радиус обхода: %.3f мм (%s)",
-                self.hole_clearance,
-                "можно касаться линии"
-                if self.allow_clearance_contact
-                else "касание запрещено",
-            )
-        else:
-            self.planning_holes = self.working_holes
+        self.planning_holes = self.working_holes
         if self.working_holes:
             logger.info("Учтено отверстий: %d", len(self.working_holes))
         self.outer_bounds = self.working_contour.bounds
@@ -179,14 +163,9 @@ class PathPlanner:
         """Допуск группировки строк заливки — от шага, не от tolerance дискретизации."""
         return max(self.geom_epsilon, self.line_distance * 0.25)
 
-    def _clearance_contact_margin(self) -> float:
-        """Отступ от линии безопасности, если касаться её нельзя."""
-        if self.allow_clearance_contact or self.hole_clearance <= 0:
-            return 0.0
-        return max(self.geom_epsilon, self.hole_clearance * 0.05)
-
     def _fill_endpoint_inset(self) -> float:
-        return self._clearance_contact_margin()
+        """Deprecated compatibility hook; clearance endpoint insets are disabled."""
+        return 0.0
 
     def generate_path(self) -> np.ndarray:
         """Генерирует траекторию змейки."""
@@ -194,6 +173,11 @@ class PathPlanner:
             return self._path_cache.copy()
 
         logger.info("Начинаем генерацию траектории")
+        self.skipped_primary_segments = 0
+        self.skipped_deferred_segments = 0
+        self.disconnected_deferred_segments = 0
+        self._bridge_route_cache.clear()
+        self._bridge_failed_cache.clear()
         lines = self._generate_fill_lines()
         logger.debug("Сгенерировано %d линий", len(lines))
         if not lines:
@@ -209,18 +193,45 @@ class PathPlanner:
                 len(primary_lines),
                 len(deferred_lines),
             )
+            primary_path: np.ndarray = np.array([])
+            primary_segments: List[Tuple[int, int, str]] = []
+            skipped_primary = 0
             try:
-                path, self.path_segments = self._connect_lines_primary(primary_lines)
-                if deferred_lines:
-                    path, self.path_segments = self._append_deferred_pass(
-                        path, self.path_segments, deferred_lines
-                    )
+                primary_path, primary_segments = self._connect_lines_primary(
+                    primary_lines
+                )
             except BridgePlanningError as exc:
                 logger.warning(
-                    "Двухфазная заливка недоступна (%s), используем полную змейку",
+                    "Основная змейка прервана (%s), продолжаем через best-effort",
                     exc,
                 )
-                path, self.path_segments = self._connect_lines(lines)
+                (
+                    primary_path,
+                    primary_segments,
+                    skipped_primary,
+                    skipped_primary_lines,
+                ) = self._connect_lines_primary_best_effort(primary_lines)
+                deferred_lines = deferred_lines + skipped_primary_lines
+
+            self.skipped_primary_segments = skipped_primary
+            if skipped_primary:
+                logger.warning(
+                    "Пропущено %d основных сегментов: перенесены в дозаполнение",
+                    skipped_primary,
+                )
+
+            path = primary_path
+            self.path_segments = primary_segments
+            if deferred_lines:
+                path, self.path_segments = self._append_deferred_pass(
+                    path, self.path_segments, deferred_lines
+                )
+                if self.skipped_deferred_segments:
+                    logger.warning(
+                        "Пропущено %d сегментов дозаполнения: "
+                        "безопасный переход не найден",
+                        self.skipped_deferred_segments,
+                    )
         else:
             path, self.path_segments = self._connect_lines(lines)
 
@@ -232,7 +243,7 @@ class PathPlanner:
         return path
 
     def get_path_segments(self) -> Tuple[Tuple[int, int, str], ...]:
-        """Индексы точек траектории по типу: fill (заливка) или travel (переход)."""
+        """Индексы точек траектории: fill или travel."""
         return tuple(self.path_segments)
 
     def _generate_fill_lines(self) -> List[np.ndarray]:
@@ -243,7 +254,6 @@ class PathPlanner:
         height = self.y_max - self.y_min
         step = self.line_distance
         log_details = bool(self.working_holes) and logger.isEnabledFor(logging.DEBUG)
-        fill_inset = self._fill_endpoint_inset()
 
         logger.debug("Генерация линий заливки: height=%.2f step=%.2f", height, step)
 
@@ -264,7 +274,6 @@ class PathPlanner:
                     y,
                     self.planning_holes,
                     tolerance=self.geom_epsilon,
-                    endpoint_inset=fill_inset,
                     log_details=log_details,
                 )
 
@@ -294,7 +303,6 @@ class PathPlanner:
                 y_center,
                 self.planning_holes,
                 tolerance=self.geom_epsilon,
-                endpoint_inset=fill_inset,
                 log_details=log_details,
             )
             for x_start, x_end in segments:
@@ -355,7 +363,6 @@ class PathPlanner:
         return max(
             self.geom_epsilon * 10,
             self.line_distance * 0.05,
-            self.hole_clearance * 0.25,
         )
 
     def _horizontal_segment_crosses_holes(
@@ -423,7 +430,6 @@ class PathPlanner:
             y,
             self.planning_holes,
             tolerance=self.geom_epsilon,
-            endpoint_inset=0.0,
         )
 
     def _wide_detour_routes(
@@ -448,6 +454,26 @@ class PathPlanner:
         x_lo = min(float(start[0]), float(end[0]))
         x_hi = max(float(start[0]), float(end[0]))
         safe_route_y_values = self._enumerate_safe_route_ys(x_lo, x_hi)
+        if not safe_route_y_values:
+            route_y_candidates: List[float] = list(
+                self._combined_route_y_levels(
+                    self.planning_holes,
+                    current_y=y_start,
+                    next_y=y_end,
+                )
+            )
+            span = float(self.y_max) - float(self.y_min)
+            sample_count = max(12, int(span / max(self.line_distance, self.geom_epsilon)))
+            for i in range(sample_count + 1):
+                route_y_candidates.append(self.y_min + span * i / sample_count)
+            unique_route_y: List[float] = []
+            for value in route_y_candidates:
+                if not any(
+                    abs(value - existing) <= self.geom_epsilon
+                    for existing in unique_route_y
+                ):
+                    unique_route_y.append(value)
+            safe_route_y_values = unique_route_y
 
         routes: List[np.ndarray] = []
         unique_bypass: List[float] = []
@@ -532,7 +558,7 @@ class PathPlanner:
 
         raise ValueError(f"Неизвестное направление обхода: {direction}")
 
-    def _boundary_clearance_route_ys(
+    def _boundary_route_ys(
         self,
         x_start: float,
         x_end: float,
@@ -577,6 +603,8 @@ class PathPlanner:
         self, point: np.ndarray, hole: Contour, margin: Optional[float] = None
     ) -> bool:
         margin = self.geom_epsilon if margin is None else margin
+        if self._point_on_polygon_boundary(point, hole.points):
+            return False
         xmin, xmax, ymin, ymax = self._hole_bounds(hole)
         if not (
             xmin + margin < point[0] < xmax - margin
@@ -585,17 +613,28 @@ class PathPlanner:
             return False
         return point_in_polygon(point, hole.points)
 
+    def _snap_bridge_endpoint(self, point: np.ndarray) -> np.ndarray:
+        """Сдвигает точку с внутренности отверстия на ближайшую вертикальную грань."""
+        x = float(point[0])
+        y = float(point[1])
+        for hole in self.planning_holes:
+            xmin, xmax, ymin, ymax = self._hole_bounds(hole)
+            if not (
+                xmin - self.geom_epsilon <= x <= xmax + self.geom_epsilon
+                and ymin - self.geom_epsilon <= y <= ymax + self.geom_epsilon
+            ):
+                continue
+            if self._point_on_polygon_boundary(point, hole.points):
+                return point
+            snap_x = xmin if abs(x - xmin) <= abs(x - xmax) else xmax
+            return np.array([snap_x, y], dtype=float)
+        return np.array(point, dtype=float)
+
     def _point_violates_clearance(
         self, point: np.ndarray, hole: Contour
     ) -> bool:
-        """True, если точка попадает в запрещённую зону вокруг отверстия."""
-        if self._point_in_hole_interior(point, hole):
-            return True
-        if not self.allow_clearance_contact and self.hole_clearance > 0:
-            return self._point_on_polygon_boundary(
-                point, hole.points, self._clearance_contact_margin()
-            )
-        return False
+        """Deprecated compatibility hook; only real hole interiors are forbidden."""
+        return self._point_in_hole_interior(point, hole)
 
     def _point_on_segment(
         self,
@@ -643,15 +682,57 @@ class PathPlanner:
             return True
         return self._point_on_polygon_boundary(point, self.working_contour.points)
 
-    def _segment_on_hole_edge(
-        self, start: np.ndarray, end: np.ndarray, hole: Contour
+    def _segment_on_fill_line(
+        self, start: np.ndarray, end: np.ndarray
     ) -> bool:
-        """True, если отрезок идёт вдоль границы отверстия."""
-        if abs(start[1] - end[1]) > self.geom_epsilon:
+        """True, если отрезок лежит на одном из интервалов заливки."""
+        if abs(float(start[1]) - float(end[1])) > self.geom_epsilon:
             return False
-        for t in (0.0, 0.25, 0.5, 0.75, 1.0):
+        y = float(start[1])
+        x_lo = min(float(start[0]), float(end[0]))
+        x_hi = max(float(start[0]), float(end[0]))
+        for x0, x1 in self._fill_x_extents_at_y(y):
+            seg_lo = min(float(x0), float(x1))
+            seg_hi = max(float(x0), float(x1))
+            if (
+                x_lo >= seg_lo - self.geom_epsilon
+                and x_hi <= seg_hi + self.geom_epsilon
+            ):
+                return True
+        return False
+
+    def _point_on_travel_surface(self, point: np.ndarray) -> bool:
+        """Точка на стенке контура, стенке hole или в зоне заливки."""
+        if self._point_on_polygon_boundary(point, self.working_contour.points):
+            return True
+        for hole in self.planning_holes:
+            if self._point_on_polygon_boundary(point, hole.points):
+                return True
+        x = float(point[0])
+        y = float(point[1])
+        for x0, x1 in self._fill_x_extents_at_y(y):
+            seg_lo = min(float(x0), float(x1))
+            seg_hi = max(float(x0), float(x1))
+            if seg_lo - self.geom_epsilon <= x <= seg_hi + self.geom_epsilon:
+                return True
+        return False
+
+    def _segment_in_travel_zone(
+        self, start: np.ndarray, end: np.ndarray
+    ) -> bool:
+        """Отрезок не пересекает hole и идёт только по стенке или материалу заливки."""
+        if self._segment_crosses_hole_interior(start, end):
+            return False
+        length = float(np.linalg.norm(end - start))
+        if length <= self.geom_epsilon:
+            return self._point_on_travel_surface(start)
+        sample_count = max(
+            5, int(length / max(self.line_distance, self.geom_epsilon)) + 1
+        )
+        for i in range(sample_count + 1):
+            t = i / sample_count
             point = start + t * (end - start)
-            if not self._point_on_polygon_boundary(point, hole.points):
+            if not self._point_on_travel_surface(point):
                 return False
         return True
 
@@ -659,6 +740,9 @@ class PathPlanner:
         self, start: np.ndarray, end: np.ndarray
     ) -> List[int]:
         """Индексы отверстий, которые пересекает отрезок."""
+        if self._segment_on_fill_line(start, end):
+            return []
+
         crossed: List[int] = []
         for idx, hole in enumerate(self.planning_holes):
             xmin, xmax, ymin, ymax = self.hole_bounds[idx]
@@ -674,27 +758,10 @@ class PathPlanner:
             ):
                 continue
 
-            if self.hole_clearance <= 0:
-                if self._segment_on_hole_edge(start, end, hole):
-                    crossed.append(idx)
-                    continue
-                for i in range(1, 12):
-                    t = i / 12.0
-                    sample = start + t * (end - start)
-                    if self._point_in_hole_interior(sample, hole):
-                        crossed.append(idx)
-                        break
-                continue
-
-            if (
-                self.allow_clearance_contact
-                and self._segment_on_hole_edge(start, end, hole)
-            ):
-                continue
-            for i in range(13):
+            for i in range(1, 12):
                 t = i / 12.0
                 sample = start + t * (end - start)
-                if self._point_violates_clearance(sample, hole):
+                if self._point_in_hole_interior(sample, hole):
                     crossed.append(idx)
                     break
         return crossed
@@ -749,7 +816,7 @@ class PathPlanner:
         outside_above = ymin - offset
         outside_below = ymax + offset
         candidates: List[float] = list(
-            self._boundary_clearance_route_ys(
+            self._boundary_route_ys(
                 float(start[0]),
                 float(end[0]),
                 current_y,
@@ -825,7 +892,7 @@ class PathPlanner:
         """Локальные обходы слева/справа/сверху/снизу от bbox отверстия."""
         if abs(start[1] - end[1]) <= self.geom_epsilon:
             routes: List[np.ndarray] = []
-            for route_y in self._boundary_clearance_route_ys(
+            for route_y in self._boundary_route_ys(
                 float(start[0]),
                 float(end[0]),
                 float(start[1]),
@@ -956,11 +1023,127 @@ class PathPlanner:
                 )
         return routes
 
-    def _polyline_is_safe_bridge(self, points: np.ndarray) -> bool:
-        return (
-            not self._polyline_crosses_hole_interior(points)
-            and not self._polyline_leaves_outer(points)
+    def _polygon_vertices(self, polygon: np.ndarray) -> np.ndarray:
+        if len(polygon) >= 2 and np.allclose(polygon[0], polygon[-1]):
+            return polygon[:-1]
+        return polygon
+
+    def _project_to_polygon_boundary(
+        self, point: np.ndarray, polygon: np.ndarray
+    ) -> Tuple[np.ndarray, int]:
+        """Проекция точки на ближайшее ребро полигона."""
+        best_dist = float("inf")
+        best_point = point.copy()
+        best_edge = 0
+        vertices = self._polygon_vertices(polygon)
+        vertex_count = len(vertices)
+        for idx in range(vertex_count):
+            start = vertices[idx]
+            end = vertices[(idx + 1) % vertex_count]
+            segment = end - start
+            length_sq = float(np.dot(segment, segment))
+            if length_sq <= self.geom_epsilon * self.geom_epsilon:
+                projection = start.copy()
+            else:
+                t = float(np.dot(point - start, segment) / length_sq)
+                t = max(0.0, min(1.0, t))
+                projection = start + t * segment
+            dist = float(np.linalg.norm(point - projection))
+            if dist < best_dist:
+                best_dist = dist
+                best_point = projection
+                best_edge = idx
+        return best_point, best_edge
+
+    def _approach_boundary(
+        self, point: np.ndarray, boundary_point: np.ndarray
+    ) -> List[np.ndarray]:
+        """Безопасный L-образный подход к точке на стенке."""
+        if float(np.linalg.norm(point - boundary_point)) <= self.geom_epsilon:
+            return [point.copy()]
+
+        via_y = np.array([point[0], boundary_point[1]], dtype=float)
+        via_x = np.array([boundary_point[0], point[1]], dtype=float)
+        options = [
+            [point.copy(), via_y, boundary_point.copy()],
+            [point.copy(), via_x, boundary_point.copy()],
+        ]
+        for route in options:
+            if all(
+                self._segment_in_travel_zone(route[idx], route[idx + 1])
+                for idx in range(len(route) - 1)
+            ):
+                return route
+        return [point.copy(), boundary_point.copy()]
+
+    def _polygon_perimeter_routes(
+        self,
+        start: np.ndarray,
+        end: np.ndarray,
+        polygon: np.ndarray,
+    ) -> List[np.ndarray]:
+        """Маршруты вдоль рёбер полигона (в т.ч. наклонные стенки)."""
+        vertices = self._polygon_vertices(polygon)
+        vertex_count = len(vertices)
+        if vertex_count < 3:
+            return []
+
+        start_proj, start_edge = self._project_to_polygon_boundary(start, polygon)
+        end_proj, end_edge = self._project_to_polygon_boundary(end, polygon)
+        routes: List[np.ndarray] = []
+
+        for step in (1, -1):
+            pts: List[np.ndarray] = []
+            pts.extend(self._approach_boundary(start, start_proj))
+            edge = start_edge
+            for _ in range(vertex_count + 1):
+                if edge == end_edge:
+                    break
+                if step > 0:
+                    pts.append(vertices[(edge + 1) % vertex_count].copy())
+                    edge = (edge + 1) % vertex_count
+                else:
+                    pts.append(vertices[edge].copy())
+                    edge = (edge - 1) % vertex_count
+
+            if float(np.linalg.norm(pts[-1] - end_proj)) > self.geom_epsilon:
+                pts.append(end_proj.copy())
+            pts.extend(self._approach_boundary(end_proj, end)[1:])
+            deduped: List[np.ndarray] = [pts[0]]
+            for point in pts[1:]:
+                if float(np.linalg.norm(point - deduped[-1])) > self.geom_epsilon:
+                    deduped.append(point)
+            if len(deduped) >= 3:
+                routes.append(np.array(deduped))
+
+        return routes
+
+    def _outer_contour_perimeter_routes(
+        self,
+        start: np.ndarray,
+        end: np.ndarray,
+    ) -> List[np.ndarray]:
+        """Маршруты вдоль рёбер внешнего контура (в т.ч. наклонные стенки)."""
+        return self._polygon_perimeter_routes(
+            start, end, self.working_contour.points
         )
+
+    def _polyline_is_safe_bridge(self, points: np.ndarray) -> bool:
+        if self._polyline_crosses_hole_interior(points):
+            return False
+        if self._polyline_leaves_outer(points):
+            return False
+        for idx in range(len(points) - 1):
+            start = points[idx]
+            end = points[idx + 1]
+            if not self._segment_in_travel_zone(start, end):
+                return False
+            dy = abs(float(end[1]) - float(start[1]))
+            if dy <= self.geom_epsilon and not self._horizontal_segment_is_valid_bridge(
+                float(start[0]), float(end[0]), float(start[1])
+            ):
+                return False
+        return True
 
     def _score_route(
         self,
@@ -972,9 +1155,32 @@ class PathPlanner:
         length = self._polyline_length(route)
         detour = 0.0
         edge_penalty = 0.0
-        if current_y is not None:
+        offset = self._route_offset()
+        if current_y is not None and next_y is not None:
+            cur = float(current_y)
+            nxt = float(next_y)
+            y_lo = min(cur, nxt)
+            y_hi = max(cur, nxt)
             for point in route[1:-1]:
-                detour += abs(float(point[1]) - current_y) * 2.0
+                y = float(point[1])
+                if y < y_lo - offset:
+                    detour += (y_lo - offset - y) * 4.0
+                elif y > y_hi + offset:
+                    detour += (y - y_hi - offset) * 4.0
+                if nxt < cur - self.geom_epsilon and y > nxt + offset:
+                    detour += (y - nxt - offset) * 4.0
+                elif nxt > cur + self.geom_epsilon and y < nxt - offset:
+                    detour += (nxt - offset - y) * 4.0
+                for hole in self.planning_holes:
+                    xmin, xmax, ymin, ymax = self._hole_bounds(hole)
+                    if (
+                        abs(y - ymin) <= self.geom_epsilon
+                        or abs(y - ymax) <= self.geom_epsilon
+                    ) and xmin - self.geom_epsilon <= point[0] <= xmax + self.geom_epsilon:
+                        edge_penalty += 5.0
+        elif current_y is not None:
+            for point in route[1:-1]:
+                detour += abs(float(point[1]) - float(current_y)) * 2.0
                 for hole in self.planning_holes:
                     xmin, xmax, ymin, ymax = self._hole_bounds(hole)
                     if (
@@ -983,7 +1189,7 @@ class PathPlanner:
                     ) and xmin - self.geom_epsilon <= point[0] <= xmax + self.geom_epsilon:
                         edge_penalty += 5.0
         if next_y is not None:
-            detour += abs(float(route[-1][1]) - next_y)
+            detour += abs(float(route[-1][1]) - float(next_y))
         return length + detour + edge_penalty
 
     def _build_bridge_candidates(
@@ -1067,6 +1273,23 @@ class PathPlanner:
             if self._polyline_is_safe_bridge(route):
                 seen_routes.append(route)
 
+        for route in self._outer_contour_perimeter_routes(start, end):
+            if self._polyline_is_safe_bridge(route):
+                if not any(
+                    route.shape == other.shape and np.allclose(route, other)
+                    for other in seen_routes
+                ):
+                    seen_routes.append(route)
+
+        for hole in holes_to_consider:
+            for route in self._polygon_perimeter_routes(start, end, hole.points):
+                if self._polyline_is_safe_bridge(route):
+                    if not any(
+                        route.shape == other.shape and np.allclose(route, other)
+                        for other in seen_routes
+                    ):
+                        seen_routes.append(route)
+
         if not seen_routes:
             logger.debug(
                 "bridge fallback: local route not found for "
@@ -1104,14 +1327,6 @@ class PathPlanner:
                 if self._polyline_is_safe_bridge(route):
                     seen_routes.append(route)
 
-        for route in self._wide_detour_routes(start, end):
-            if self._polyline_is_safe_bridge(route):
-                if not any(
-                    route.shape == other.shape and np.allclose(route, other)
-                    for other in seen_routes
-                ):
-                    seen_routes.append(route)
-
         for route in self._outer_detour_routes(start, end):
             if self._polyline_is_safe_bridge(route):
                 if not any(
@@ -1119,6 +1334,15 @@ class PathPlanner:
                     for other in seen_routes
                 ):
                     seen_routes.append(route)
+
+        if not seen_routes:
+            for route in self._wide_detour_routes(start, end):
+                if self._polyline_is_safe_bridge(route):
+                    if not any(
+                        route.shape == other.shape and np.allclose(route, other)
+                        for other in seen_routes
+                    ):
+                        seen_routes.append(route)
 
         for route in seen_routes:
             if not any(
@@ -1146,8 +1370,11 @@ class PathPlanner:
         *,
         current_y: Optional[float] = None,
         next_y: Optional[float] = None,
+        log_error: bool = True,
     ) -> np.ndarray:
         """Прямой переход для основной змейки; обход только если прямая небезопасна."""
+        start = self._snap_bridge_endpoint(start)
+        end = self._snap_bridge_endpoint(end)
         if np.linalg.norm(end - start) <= self.geom_epsilon:
             return np.array([start])
 
@@ -1156,7 +1383,11 @@ class PathPlanner:
             return direct_route
 
         return self._bridge_points(
-            start, end, current_y=current_y, next_y=next_y
+            start,
+            end,
+            current_y=current_y,
+            next_y=next_y,
+            log_error=log_error,
         )
 
     def _bridge_cost_simple(
@@ -1169,7 +1400,11 @@ class PathPlanner:
     ) -> float:
         try:
             route = self._bridge_points_simple(
-                start, end, current_y=current_y, next_y=next_y
+                start,
+                end,
+                current_y=current_y,
+                next_y=next_y,
+                log_error=False,
             )
         except BridgePlanningError:
             return float("inf")
@@ -1185,46 +1420,12 @@ class PathPlanner:
         rows = self._group_lines_by_y(lines)
         primary: List[np.ndarray] = []
         deferred: List[np.ndarray] = []
-        prev_point: Optional[np.ndarray] = None
-
-        def _entry_cost_to_next_row(
-            exit_point: np.ndarray,
-            current_y: float,
-            row_idx: int,
-        ) -> float:
-            if row_idx + 1 >= len(rows):
-                return 0.0
-            next_y_level, next_row_lines = rows[row_idx + 1]
-            best = float("inf")
-            for next_line in next_row_lines:
-                left, right = self._segment_endpoints(next_line)
-                for entry in (left, right):
-                    cost = self._bridge_cost_simple(
-                        exit_point,
-                        entry,
-                        current_y=float(current_y),
-                        next_y=float(next_y_level),
-                    )
-                    if cost < best:
-                        best = cost
-            return 0.0 if best == float("inf") else best
 
         for row_idx, (y_level, row_lines) in enumerate(rows):
             preferred_ltr = row_idx % 2 == 0
 
             if len(row_lines) == 1:
-                line = row_lines[0]
-                left, right = self._segment_endpoints(line)
-                if row_idx + 1 < len(rows):
-                    cost_right = _entry_cost_to_next_row(right, y_level, row_idx)
-                    cost_left = _entry_cost_to_next_row(left, y_level, row_idx)
-                    if cost_right <= cost_left:
-                        prev_point = right
-                    else:
-                        prev_point = left
-                else:
-                    prev_point = right if preferred_ltr else left
-                primary.append(line)
+                primary.append(row_lines[0])
                 continue
 
             if len(row_lines) > 1:
@@ -1234,16 +1435,6 @@ class PathPlanner:
                         np.linalg.norm(line[1] - line[0])
                     ),
                 )
-                left, right = self._segment_endpoints(best_line)
-                if prev_point is None:
-                    prev_point = right if preferred_ltr else left
-                else:
-                    cost_right = _entry_cost_to_next_row(right, y_level, row_idx)
-                    cost_left = _entry_cost_to_next_row(left, y_level, row_idx)
-                    if cost_left <= cost_right:
-                        prev_point = left
-                    else:
-                        prev_point = right
                 primary.append(best_line)
                 for line in row_lines:
                     if line is not best_line:
@@ -1283,12 +1474,20 @@ class PathPlanner:
 
             for seg_idx, (seg_start, seg_end) in enumerate(ordered_segments):
                 if path_points:
-                    bridge = self._bridge_points_simple(
-                        path_points[-1],
-                        seg_start,
-                        current_y=float(path_points[-1][1]),
-                        next_y=float(seg_start[1]),
-                    )
+                    try:
+                        bridge = self._bridge_points_simple(
+                            path_points[-1],
+                            seg_start,
+                            current_y=float(path_points[-1][1]),
+                            next_y=float(seg_start[1]),
+                            log_error=False,
+                        )
+                    except BridgePlanningError as exc:
+                        raise BridgePlanningError(
+                            f"Не удалось построить безопасный обход отверстия: "
+                            f"({path_points[-1][0]:.2f}, {path_points[-1][1]:.2f}) -> "
+                            f"({seg_start[0]:.2f}, {seg_start[1]:.2f})"
+                        ) from exc
                     travel_start = len(path_points) - 1
                     self._append_polyline(path_points, bridge[1:])
                     self._record_path_segment(
@@ -1317,6 +1516,147 @@ class PathPlanner:
                 )
 
         return np.array(path_points), segments
+
+    def _connect_lines_primary_best_effort(
+        self, lines: List[np.ndarray]
+    ) -> Tuple[np.ndarray, List[Tuple[int, int, str]], int, List[np.ndarray]]:
+        """
+        Строит непрерывный безопасный фрагмент основной змейки без падения.
+
+        Если следующий основной сегмент нельзя безопасно соединить с текущей
+        траекторией, он пропускается и возвращается для дозаполнения.
+        """
+        if not lines:
+            return np.array([]), [], 0, []
+
+        rows = self._group_lines_by_y(lines)
+        path_points: List[np.ndarray] = []
+        segments: List[Tuple[int, int, str]] = []
+        skipped = 0
+        skipped_lines: List[np.ndarray] = []
+
+        for row_idx, (y_level, row_lines) in enumerate(rows):
+            preferred_ltr = row_idx % 2 == 0
+            for line in row_lines:
+                left, right = self._segment_endpoints(line)
+                orientations = (
+                    [(left, right), (right, left)]
+                    if preferred_ltr
+                    else [(right, left), (left, right)]
+                )
+
+                bridge: Optional[np.ndarray] = None
+                seg_start, seg_end = orientations[0]
+                if path_points:
+                    for candidate_start, candidate_end in orientations:
+                        try:
+                            bridge = self._bridge_points_simple(
+                                path_points[-1],
+                                candidate_start,
+                                current_y=float(path_points[-1][1]),
+                                next_y=float(candidate_start[1]),
+                                log_error=False,
+                            )
+                        except BridgePlanningError:
+                            continue
+                        seg_start, seg_end = candidate_start, candidate_end
+                        break
+
+                    if bridge is None:
+                        skipped += 1
+                        skipped_lines.append(line)
+                        logger.debug(
+                            "Пропуск основной змейки y=%.2f: "
+                            "безопасный переход не найден, отложено дозаполнение",
+                            y_level,
+                        )
+                        continue
+
+                    travel_start = len(path_points) - 1
+                    self._append_polyline(path_points, bridge[1:])
+                    self._record_path_segment(
+                        segments,
+                        travel_start,
+                        len(path_points) - 1,
+                        "travel",
+                    )
+
+                fill_start = self._ensure_point(path_points, seg_start)
+                self._append_point(path_points, seg_end)
+                self._record_path_segment(
+                    segments,
+                    fill_start,
+                    len(path_points) - 1,
+                    "fill",
+                )
+
+        return np.array(path_points), segments, skipped, skipped_lines
+
+    def _try_append_deferred_fill(
+        self,
+        path_points: List[np.ndarray],
+        segments: List[Tuple[int, int, str]],
+        line: np.ndarray,
+        preferred_ltr: bool,
+    ) -> bool:
+        """Добавляет отложенный fill-сегмент через безопасный обход вдоль стенок."""
+        preferred_start, preferred_end = self._orient_segment(line, preferred_ltr)
+        orientations = [
+            (preferred_start, preferred_end),
+            (preferred_end, preferred_start),
+        ]
+        current = path_points[-1] if path_points else None
+        best: Optional[Tuple[float, np.ndarray, np.ndarray, np.ndarray]] = None
+
+        for orientation_idx, (seg_start, seg_end) in enumerate(orientations):
+            if current is not None:
+                try:
+                    bridge = self._bridge_points(
+                        current,
+                        seg_start,
+                        current_y=float(current[1]),
+                        next_y=float(seg_start[1]),
+                        log_error=False,
+                    )
+                except BridgePlanningError:
+                    continue
+            else:
+                bridge = np.array([seg_start])
+
+            score = self._score_route(
+                bridge,
+                current_y=float(current[1]) if current is not None else None,
+                next_y=float(seg_start[1]),
+            )
+            if orientation_idx:
+                score += self.line_distance * 0.1
+            if best is None or score < best[0]:
+                best = (score, bridge, seg_start, seg_end)
+
+        if best is None:
+            return False
+
+        _, bridge, seg_start, seg_end = best
+        if path_points and len(bridge) > 0:
+            travel_start = len(path_points) - 1
+            self._append_polyline(path_points, bridge[1:])
+            if len(path_points) - 1 > travel_start:
+                self._record_path_segment(
+                    segments,
+                    travel_start,
+                    len(path_points) - 1,
+                    "travel",
+                )
+
+        fill_start = self._ensure_point(path_points, seg_start)
+        self._append_point(path_points, seg_end)
+        self._record_path_segment(
+            segments,
+            fill_start,
+            len(path_points) - 1,
+            "fill",
+        )
+        return True
 
     def _order_row_segments_simple(
         self,
@@ -1351,86 +1691,144 @@ class PathPlanner:
         segments: List[Tuple[int, int, str]],
         deferred_lines: List[np.ndarray],
     ) -> Tuple[np.ndarray, List[Tuple[int, int, str]]]:
-        """Фаза 2: дозаполняет пропущенные сегменты построчно."""
+        """Фаза 2: дозаполняет пропуски безопасными обходами вдоль стенок."""
         path_points: List[np.ndarray] = list(path)
-        pending_rows = self._group_lines_by_y(deferred_lines)
-        row_pass_idx = 0
+        pending: List[Tuple[float, np.ndarray, bool]] = []
 
-        while pending_rows:
-            current = path_points[-1] if path_points else None
-            best_row_idx = -1
-            best_cost = float("inf")
-
-            for row_idx, (y_level, row_lines) in enumerate(pending_rows):
-                for line in row_lines:
-                    left, right = self._segment_endpoints(line)
-                    for entry in (left, right):
-                        if current is None:
-                            cost = 0.0
-                        else:
-                            cost = self._bridge_cost(
-                                current,
-                                entry,
-                                current_y=float(current[1]),
-                                next_y=float(y_level),
-                            )
-                        if cost < best_cost:
-                            best_cost = cost
-                            best_row_idx = row_idx
-
-            if best_row_idx < 0 or best_cost == float("inf"):
-                raise BridgePlanningError(
-                    "Не удалось дозаполнить пропущенные сегменты у отверстий"
-                )
-
-            y_level, row_lines = pending_rows.pop(best_row_idx)
+        for row_pass_idx, (y_level, row_lines) in enumerate(
+            self._group_lines_by_y(deferred_lines)
+        ):
             preferred_ltr = row_pass_idx % 2 == 0
-            prev_point = path_points[-1] if path_points else None
-            ordered_segments = self._order_row_segments(
+            sorted_lines = sorted(
                 row_lines,
-                prev_point,
-                preferred_ltr,
+                key=lambda line: self._segment_endpoints(line)[0][0],
+                reverse=not preferred_ltr,
+            )
+            pending.extend((y_level, line, preferred_ltr) for line in sorted_lines)
+
+        while pending:
+            if path_points:
+                current = path_points[-1]
+
+                def distance_to_current(
+                    item: Tuple[float, np.ndarray, bool],
+                ) -> float:
+                    _, line, _ = item
+                    left, right = self._segment_endpoints(line)
+                    return min(
+                        float(np.linalg.norm(current - left)),
+                        float(np.linalg.norm(current - right)),
+                    )
+
+                pending.sort(key=distance_to_current)
+
+            filled = False
+            for idx, (y_level, line, preferred_ltr) in enumerate(pending[:3]):
+                if self._try_append_deferred_fill(
+                    path_points,
+                    segments,
+                    line,
+                    preferred_ltr,
+                ):
+                    pending.pop(idx)
+                    left, right = self._segment_endpoints(line)
+                    logger.debug(
+                        "Дозаполнение y=%.2f: (%.2f, %.2f) -> (%.2f, %.2f)",
+                        y_level,
+                        left[0],
+                        left[1],
+                        right[0],
+                        right[1],
+                    )
+                    filled = True
+                    break
+
+            if filled:
+                continue
+
+            y_level, _, _ = pending.pop(0)
+            self.skipped_deferred_segments += 1
+            logger.warning(
+                "Дозаполнение y=%.2f пропущено: безопасный переход не найден",
                 y_level,
-                None,
             )
 
-            for seg_start, seg_end in ordered_segments:
-                if path_points:
-                    bridge = self._bridge_points(
-                        path_points[-1],
-                        seg_start,
-                        current_y=float(path_points[-1][1]),
-                        next_y=float(seg_start[1]),
-                    )
-                    travel_start = len(path_points) - 1
-                    self._append_polyline(path_points, bridge[1:])
-                    self._record_path_segment(
-                        segments,
-                        travel_start,
-                        len(path_points) - 1,
-                        "travel",
-                    )
-
-                fill_start = self._ensure_point(path_points, seg_start)
-                self._append_point(path_points, seg_end)
-                self._record_path_segment(
-                    segments,
-                    fill_start,
-                    len(path_points) - 1,
-                    "fill",
-                )
-                logger.debug(
-                    "Дозаполнение y=%.2f: (%.2f, %.2f) -> (%.2f, %.2f)",
-                    y_level,
-                    seg_start[0],
-                    seg_start[1],
-                    seg_end[0],
-                    seg_end[1],
-                )
-
-            row_pass_idx += 1
-
         return np.array(path_points), segments
+
+    def _deferred_bridge_option(
+        self,
+        path_points: List[np.ndarray],
+        line: np.ndarray,
+        preferred_ltr: bool,
+    ) -> Optional[Tuple[float, np.ndarray, np.ndarray, np.ndarray]]:
+        """Лучший безопасный переход к одному отложенному сегменту."""
+        preferred_start, preferred_end = self._orient_segment(line, preferred_ltr)
+        orientations = [
+            (preferred_start, preferred_end),
+            (preferred_end, preferred_start),
+        ]
+
+        if not path_points:
+            return 0.0, np.array([preferred_start]), preferred_start, preferred_end
+
+        current = path_points[-1]
+        best: Optional[Tuple[float, np.ndarray, np.ndarray, np.ndarray]] = None
+        for orientation_idx, (seg_start, seg_end) in enumerate(orientations):
+            try:
+                bridge = self._bridge_points(
+                    current,
+                    seg_start,
+                    current_y=float(current[1]),
+                    next_y=float(seg_start[1]),
+                    log_error=False,
+                )
+            except BridgePlanningError:
+                continue
+
+            score = self._score_route(
+                bridge,
+                current_y=float(current[1]),
+                next_y=float(seg_start[1]),
+            )
+            if orientation_idx:
+                score += self.line_distance * 0.1
+            if best is None or score < best[0]:
+                best = (score, bridge, seg_start, seg_end)
+
+        return best
+
+    def _deferred_outer_bridge(
+        self,
+        start: np.ndarray,
+        end: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        """Быстрый дальний мост для дозаполнения без полного перебора кандидатов."""
+        direct = np.array([start, end])
+        if self._polyline_is_safe_bridge(direct):
+            return direct
+
+        best: Optional[np.ndarray] = None
+        best_score = float("inf")
+        xmin, xmax, _, _ = self.outer_bounds
+        routes: List[np.ndarray] = []
+        for wall_x in (xmin, xmax):
+            routes.append(
+                np.array([
+                    start,
+                    [wall_x, start[1]],
+                    [wall_x, end[1]],
+                    end,
+                ])
+            )
+
+        for route in routes:
+            if not self._polyline_is_safe_bridge(route):
+                continue
+            score = self._polyline_length(route)
+            if score < best_score:
+                best = route
+                best_score = score
+        return best
 
     def _bridge_points(
         self,
@@ -1442,6 +1840,8 @@ class PathPlanner:
         log_error: bool = True,
     ) -> np.ndarray:
         """Строит переход между точками, обходя отверстия снаружи."""
+        start = self._snap_bridge_endpoint(start)
+        end = self._snap_bridge_endpoint(end)
         if np.linalg.norm(end - start) <= self.geom_epsilon:
             return np.array([start])
 
@@ -1465,9 +1865,9 @@ class PathPlanner:
                 f"Не удалось построить безопасный обход отверстия: "
                 f"({start[0]:.2f}, {start[1]:.2f}) -> ({end[0]:.2f}, {end[1]:.2f})"
             )
-            self._bridge_failed_cache.add(cache_key)
             if log_error:
-                logger.error(msg)
+                self._bridge_failed_cache.add(cache_key)
+                logger.warning(msg)
             raise BridgePlanningError(msg)
 
         best = min(
@@ -1710,6 +2110,12 @@ class PathPlanner:
                 "total_points": 0,
                 "total_length": 0.0,
                 "num_lines": 0,
+                "filled_segments": 0,
+                "skipped_primary_segments": self.skipped_primary_segments,
+                "skipped_deferred_segments": self.skipped_deferred_segments,
+                "disconnected_deferred_segments": (
+                    self.disconnected_deferred_segments
+                ),
                 "y_range": (self.y_min, self.y_max),
             }
         total_length = 0.0
@@ -1723,6 +2129,14 @@ class PathPlanner:
             "total_points": len(path),
             "total_length": total_length,
             "num_lines": len(self._generate_fill_lines()),
+            "filled_segments": sum(
+                1 for _, _, kind in self.path_segments if kind == "fill"
+            ),
+            "skipped_primary_segments": self.skipped_primary_segments,
+            "skipped_deferred_segments": self.skipped_deferred_segments,
+            "disconnected_deferred_segments": (
+                self.disconnected_deferred_segments
+            ),
             "y_range": (self.y_min, self.y_max),
             "line_distance": self.line_distance,
             "fill_angle": self.fill_angle,
